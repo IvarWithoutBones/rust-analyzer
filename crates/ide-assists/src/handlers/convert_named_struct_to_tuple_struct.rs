@@ -2,8 +2,10 @@ use either::Either;
 use ide_db::{defs::Definition, search::FileReference};
 use itertools::Itertools;
 use syntax::{
-    ast::{self, AstNode, HasGenericParams, HasVisibility},
-    match_ast, SyntaxKind,
+    ast::{self, AstNode, HasAttrs, HasGenericParams, HasVisibility},
+    match_ast,
+    ted::{self, Position},
+    SyntaxKind,
 };
 
 use crate::{assist_context::SourceChangeBuilder, AssistContext, AssistId, AssistKind, Assists};
@@ -87,9 +89,18 @@ fn edit_struct_def(
 ) {
     // Note that we don't need to consider macro files in this function because this is
     // currently not triggered for struct definitions inside macro calls.
-    let tuple_fields = record_fields
-        .fields()
-        .filter_map(|f| Some(ast::make::tuple_field(f.visibility(), f.ty()?)));
+    let tuple_fields = record_fields.fields().filter_map(|field| {
+        let tuple_field =
+            ast::make::tuple_field(field.visibility(), field.ty()?).clone_for_update();
+        for attr in field.attrs() {
+            let before_field = tuple_field
+                .syntax()
+                .last_child()
+                .map_or(Position::first_child_of(tuple_field.syntax()), Position::before);
+            ted::insert(before_field, attr.syntax().clone_for_update());
+        }
+        Some(tuple_field)
+    });
     let tuple_fields = ast::make::tuple_field_list(tuple_fields);
     let record_fields_text_range = record_fields.syntax().text_range();
 
@@ -176,17 +187,19 @@ fn process_struct_name_reference(
                 // When we failed to get the original range for the whole struct expression node,
                 // we can't provide any reasonable edit. Leave it untouched.
                 let file_range = ctx.sema.original_range_opt(record_struct_pat.syntax())?;
-                edit.replace(
-                    file_range.range,
-                    ast::make::tuple_struct_pat(
-                        record_struct_pat.path()?,
-                        record_struct_pat
-                            .record_pat_field_list()?
-                            .fields()
-                            .filter_map(|pat| pat.pat())
-                    )
-                    .to_string()
-                );
+                let path = record_struct_pat.path()?;
+                let args = record_struct_pat
+                    .record_pat_field_list()?
+                    .fields()
+                    .filter_map(|f| Some((f.attrs(), f.pat()?)))
+                    .map(|(attr, pat)| {
+                        attr.map(|attr| attr.to_string())
+                            .chain(std::iter::once(pat.to_string()))
+                            .join(" ")
+                    })
+                    .join(", ");
+
+                edit.replace(file_range.range, format!("{path}({args})"));
             },
             ast::RecordExpr(record_expr) => {
                 // When we failed to get the original range for the whole struct pattern node,
@@ -196,7 +209,12 @@ fn process_struct_name_reference(
                 let args = record_expr
                     .record_expr_field_list()?
                     .fields()
-                    .filter_map(|f| f.expr())
+                    .filter_map(|f| Some((f.attrs(), f.expr()?)))
+                    .map(|(attr, expr)| {
+                        attr.map(|attr| attr.to_string())
+                            .chain(std::iter::once(expr.to_string()))
+                            .join(" ")
+                    })
                     .join(", ");
 
                 edit.replace(file_range.range, format!("{path}({args})"));
@@ -973,6 +991,46 @@ impl HasAssoc for Struct {
             value: 42,
         };
         let Self::Assoc { value } = a;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_field_attributes() {
+        check_assist(
+            convert_named_struct_to_tuple_struct,
+            r#"
+struct Foo$0 {
+    #[cfg(unix)]
+    bar: usize,
+    baz: u32,
+    #[cfg(test)]
+    #[cfg(windows)]
+    qux: u128,
+}
+
+impl Foo {
+    fn new() -> Self {
+        Self { #[cfg(unix)] bar: 0, baz: 1, #[cfg(test)] #[cfg(windows)] qux: 2 }
+    }
+
+    fn destructure(self) {
+        let Foo { #[cfg(unix)] bar, baz, #[cfg(test)] #[cfg(windows)] qux } = self;
+    }
+}
+"#,
+            r#"
+struct Foo(#[cfg(unix)] usize, u32, #[cfg(test)] #[cfg(windows)] u128);
+
+impl Foo {
+    fn new() -> Self {
+        Self(#[cfg(unix)] 0, 1, #[cfg(test)] #[cfg(windows)] 2)
+    }
+
+    fn destructure(self) {
+        let Foo(#[cfg(unix)] bar, baz, #[cfg(test)] #[cfg(windows)] qux) = self;
     }
 }
 "#,
